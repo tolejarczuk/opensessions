@@ -9,6 +9,14 @@ use crate::protocol::AgentStatus;
 const THREAD_NAME_MAX: usize = 80;
 const TOOL_USE_WAIT_MS: u64 = 3_000;
 const STUCK_MS: u64 = 15_000;
+/// OpenCode persists to SQLite only at discrete checkpoints (step boundaries,
+/// tool results), so no row is touched while the model reasons or writes a long
+/// answer. Give those phases a generous window before calling the session
+/// stale; a crashed process still stops updating and will be flagged.
+const OPENCODE_GENERATING_STUCK_MS: u64 = 5 * 60 * 1000;
+/// Long-running tools (builds, test suites, subagents) legitimately produce no
+/// database writes for many minutes, so tool execution gets a wider window.
+const OPENCODE_TOOL_STUCK_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWatcherSnapshot {
@@ -183,8 +191,15 @@ pub fn opencode_snapshot_from_row(
 ) -> Option<AgentWatcherSnapshot> {
     let message = serde_json::from_str::<Value>(last_message_json).ok()?;
     let mut status = determine_opencode_status(&message);
-    if status == AgentStatus::Running && now_ms.saturating_sub(time_updated) >= STUCK_MS {
-        status = AgentStatus::Stale;
+    if status == AgentStatus::Running {
+        let stuck_after = if opencode_has_active_tool(&message) {
+            OPENCODE_TOOL_STUCK_MS
+        } else {
+            OPENCODE_GENERATING_STUCK_MS
+        };
+        if now_ms.saturating_sub(time_updated) >= stuck_after {
+            status = AgentStatus::Stale;
+        }
     }
     let last_user_prompt = last_user_prompt_json.and_then(extract_opencode_user_prompt_json);
 
@@ -199,6 +214,24 @@ pub fn opencode_snapshot_from_row(
         status,
         ts: now_ms,
     })
+}
+
+/// True when the last message has a tool part that is still executing. Used to
+/// pick the stale threshold: a running tool is expected to stay silent for much
+/// longer than normal generation.
+fn opencode_has_active_tool(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("tool")
+                    && part
+                        .pointer("/state/status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| !matches!(status, "completed" | "error"))
+            })
+        })
 }
 
 pub fn pi_snapshot_from_jsonl(
@@ -798,5 +831,88 @@ mod tests {
             Some("Ship this sidebar")
         );
         assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn opencode_running_tool_gets_a_long_stale_window() {
+        let last_message = r#"{"role":"assistant","finish":"tool-calls","content":[{"type":"tool","state":{"status":"running"}}]}"#;
+        let base = 1_000_000_000;
+
+        // A tool running for four minutes is normal (builds, tests, subagents)
+        // and must not be flagged stale.
+        let snapshot = opencode_snapshot_from_row(
+            "ses_1",
+            None,
+            "/repo",
+            base,
+            last_message,
+            None,
+            base + 4 * 60 * 1000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Running);
+
+        // Beyond the tool window the session is considered stale.
+        let snapshot = opencode_snapshot_from_row(
+            "ses_1",
+            None,
+            "/repo",
+            base,
+            last_message,
+            None,
+            base + 11 * 60 * 1000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Stale);
+    }
+
+    #[test]
+    fn opencode_thinking_gets_a_generous_stale_window() {
+        let last_message = r#"{"role":"assistant","finish":"tool-calls","content":[{"type":"reasoning","text":"thinking"},{"type":"text","text":"writing"}]}"#;
+        let base = 1_000_000_000;
+
+        // Long reasoning / answer-writing phases go minutes without a database
+        // write; four minutes must not be flagged stale.
+        let snapshot = opencode_snapshot_from_row(
+            "ses_1",
+            None,
+            "/repo",
+            base,
+            last_message,
+            None,
+            base + 4 * 60 * 1000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Running);
+
+        let snapshot = opencode_snapshot_from_row(
+            "ses_1",
+            None,
+            "/repo",
+            base,
+            last_message,
+            None,
+            base + 6 * 60 * 1000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Stale);
+    }
+
+    #[test]
+    fn opencode_completed_tools_use_the_generation_window() {
+        let last_message = r#"{"role":"assistant","finish":"tool-calls","content":[{"type":"tool","state":{"status":"completed"}}]}"#;
+        let base = 1_000_000_000;
+
+        let snapshot = opencode_snapshot_from_row(
+            "ses_1",
+            None,
+            "/repo",
+            base,
+            last_message,
+            None,
+            base + 6 * 60 * 1000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Stale);
     }
 }

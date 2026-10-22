@@ -26,7 +26,7 @@ use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
-    build_dir_session_map, resolve_session_for_project_dir,
+    build_dir_session_map, related_session_candidates, resolve_session_for_project_dir,
 };
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
@@ -1242,7 +1242,44 @@ impl ReadOnlyMuxStateSource {
                 .into_iter()
                 .map(|session| (session.name, session.dir)),
         );
-        resolve_session_for_project_dir(project_dir, &dir_session_map)
+        if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
+            return Some(session);
+        }
+
+        // Two live tmux sessions can share the same start directory (for example
+        // scratch sessions opened in `$HOME`), which makes the directory lookup
+        // ambiguous. Without a fallback, every snapshot for this agent would be
+        // dropped forever. Disambiguate by finding the candidate whose panes
+        // actually run this agent, and only proceed when exactly one qualifies.
+        let candidates = related_session_candidates(project_dir, &dir_session_map);
+        let mut resolved: Option<String> = None;
+        for name in &candidates {
+            let Some(provider) = self.provider_for_session(name) else {
+                continue;
+            };
+            let has_agent_pane = provider
+                .list_agent_panes(name)
+                .iter()
+                .any(|pane| pane.agent == snapshot.agent);
+            if !has_agent_pane {
+                continue;
+            }
+            if resolved.is_some() {
+                debug_log(format!(
+                    "resolve_agent_watcher_session: agent panes ambiguous agent={} project_dir={:?} candidates={candidates:?}",
+                    snapshot.agent, project_dir,
+                ));
+                return None;
+            }
+            resolved = Some(name.clone());
+        }
+        if let Some(session) = &resolved {
+            debug_log(format!(
+                "resolve_agent_watcher_session: resolved ambiguous dir via agent panes session={} agent={} project_dir={:?} candidates={candidates:?}",
+                session, snapshot.agent, project_dir,
+            ));
+        }
+        resolved
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {
@@ -1996,8 +2033,21 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
     }
 
     let stale_threshold = now_ms.saturating_sub(AGENT_WATCHER_RECENT_MS);
-    let query = format!(
-        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),''), ifnull((SELECT sm.data FROM session_message sm WHERE sm.session_id = r.id AND sm.type = 'user' ORDER BY sm.seq DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+    // OpenCode V2 moved sessions and messages to session_v2/session_message and
+    // left the legacy session/message tables frozen after the V1->V2 migration,
+    // so the V2 shape is tried first. V2 assistant rows carry no "role" field,
+    // so inject it from the row type before the JSON reaches the status parser.
+    // Subagent sessions (parent_id set) are internal workers of their parent
+    // session: excluding them keeps notifications and the sidebar focused on
+    // the top-level session state.
+    let v2_query = format!(
+        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session_v2 WHERE time_updated > {stale_threshold} AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT CASE WHEN json_valid(sm.data) THEN json_set(sm.data, '$.role', sm.type) ELSE sm.data END FROM session_message sm WHERE sm.session_id = r.id AND sm.type IN ('user','assistant') ORDER BY sm.seq DESC LIMIT 1),''), ifnull((SELECT sm.data FROM session_message sm WHERE sm.session_id = r.id AND sm.type = 'user' ORDER BY sm.seq DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+    );
+    let session_message_query = format!(
+        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),''), ifnull((SELECT sm.data FROM session_message sm WHERE sm.session_id = r.id AND sm.type = 'user' ORDER BY sm.seq DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+    );
+    let legacy_query = format!(
+        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
     );
     let run_query = |query: String| {
         let mut command = process::Command::new("sqlite3");
@@ -2009,27 +2059,13 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
             .arg(query);
         run_process_with_timeout(command, Duration::from_millis(OPENCODE_SQL_TIMEOUT_MS))
     };
-    let output = run_query(query).or_else(|| {
-        let legacy_query = format!(
-            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
-        );
-        run_query(legacy_query)
-    });
-    let Some(mut output) = output else {
+    let output = run_query(v2_query)
+        .filter(|output| output.status.success())
+        .or_else(|| run_query(session_message_query).filter(|output| output.status.success()))
+        .or_else(|| run_query(legacy_query).filter(|output| output.status.success()));
+    let Some(output) = output else {
         return;
     };
-    if !output.status.success() {
-        let legacy_query = format!(
-            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
-        );
-        let Some(legacy_output) = run_query(legacy_query) else {
-            return;
-        };
-        if !legacy_output.status.success() {
-            return;
-        }
-        output = legacy_output;
-    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -3018,4 +3054,89 @@ fn clamp_detail_panel_height(height: u16) -> u16 {
 
 fn parse_command(message: &Message) -> Option<Value> {
     serde_json::from_str::<Value>(message.as_text()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-server-test-{name}-{}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        home
+    }
+
+    fn create_opencode_db(home: &Path, statements: &str) {
+        let db_dir = home.join(".local/share/opencode");
+        fs::create_dir_all(&db_dir).expect("create opencode db dir");
+        let output = process::Command::new("sqlite3")
+            .arg(db_dir.join("opencode.db"))
+            .arg(statements)
+            .output()
+            .expect("run sqlite3");
+        assert!(
+            output.status.success(),
+            "sqlite3 failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scan_opencode_sessions_reads_v2_schema() {
+        let home = temp_home("opencode-v2");
+        create_opencode_db(
+            &home,
+            "CREATE TABLE session_v2 (id text PRIMARY KEY, title text, directory text NOT NULL, time_updated integer NOT NULL, parent_id text);
+             CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL, data text NOT NULL);
+             INSERT INTO session_v2 (id, title, directory, time_updated, parent_id) VALUES ('ses_v2', 'V2 session', '/repo/v2', 1000000, NULL);
+             INSERT INTO session_v2 (id, title, directory, time_updated, parent_id) VALUES ('ses_v2_sub', 'Subagent task', '/repo/v2', 1000000, 'ses_v2');
+             INSERT INTO session_message VALUES ('msg_user', 'ses_v2', 'user', 1, '{\"text\":\"Ship the fix\"}');
+             INSERT INTO session_message VALUES ('msg_assistant', 'ses_v2', 'assistant', 2, '{\"time\":{\"completed\":1000001},\"finish\":\"stop\"}');
+             INSERT INTO session_message VALUES ('msg_sub', 'ses_v2_sub', 'assistant', 1, '{\"time\":{\"completed\":1000001},\"finish\":\"stop\"}');",
+        );
+
+        let mut snapshots = Vec::new();
+        scan_opencode_sessions(&home, 1_001_000, &mut snapshots);
+
+        // The subagent session (parent_id set) must be excluded so it never
+        // reaches the sidebar or the notifier.
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.agent, "opencode");
+        assert_eq!(snapshot.thread_id.as_deref(), Some("ses_v2"));
+        assert_eq!(snapshot.thread_name.as_deref(), Some("V2 session"));
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo/v2"));
+        assert_eq!(snapshot.last_user_prompt.as_deref(), Some("Ship the fix"));
+        assert_eq!(snapshot.status, AgentStatus::Done);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn scan_opencode_sessions_falls_back_to_legacy_schema() {
+        let home = temp_home("opencode-v1");
+        create_opencode_db(
+            &home,
+            "CREATE TABLE session (id text PRIMARY KEY, title text NOT NULL, directory text NOT NULL, time_updated integer NOT NULL, parent_id text);
+             CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, data text NOT NULL);
+             INSERT INTO session (id, title, directory, time_updated, parent_id) VALUES ('ses_v1', 'Legacy session', '/repo/v1', 1000000, NULL);
+             INSERT INTO session (id, title, directory, time_updated, parent_id) VALUES ('ses_v1_sub', 'Legacy subagent', '/repo/v1', 1000000, 'ses_v1');
+             INSERT INTO message VALUES ('msg_1', 'ses_v1', 999999, '{\"role\":\"assistant\",\"finish\":\"tool-calls\"}');",
+        );
+
+        let mut snapshots = Vec::new();
+        scan_opencode_sessions(&home, 1_000_100, &mut snapshots);
+
+        // The legacy subagent session must be excluded as well.
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.thread_id.as_deref(), Some("ses_v1"));
+        assert_eq!(snapshot.thread_name.as_deref(), Some("Legacy session"));
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo/v1"));
+        assert_eq!(snapshot.last_user_prompt, None);
+        assert_eq!(snapshot.status, AgentStatus::Running);
+        let _ = fs::remove_dir_all(&home);
+    }
 }
