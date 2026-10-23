@@ -1388,7 +1388,9 @@ time.sleep(300)
     where
         F: Fn(&str) -> bool,
     {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // 50-sidebar latency probes can take several seconds to render a
+        // specific pane on a loaded CI runner.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let capture = self.capture_pane(pane);
             if predicate(&capture) {
@@ -1882,18 +1884,26 @@ time.sleep(300)
         let target = format!("{session}:{window}");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            // Match on title as well as command: tmux reports the launcher
+            // shell (e.g. `bash`, which does not exec its final command) as
+            // pane_current_command on some hosts, so command alone is not a
+            // reliable sidebar marker.
             let output = self.tmux([
                 "list-panes",
                 "-t",
                 &target,
                 "-F",
-                "#{pane_id} #{pane_current_command}",
+                "#{pane_id}\t#{pane_current_command}\t#{pane_title}\t#{pane_dead}",
             ]);
             if let Some(pane) = output.lines().find_map(|line| {
-                let (pane, command) = line.split_once(' ')?;
-                command
-                    .starts_with("opensessions")
-                    .then(|| pane.to_string())
+                let mut parts = line.split('\t');
+                let pane = parts.next()?;
+                let command = parts.next()?;
+                let title = parts.next()?;
+                let dead = parts.next()?;
+                (dead != "1"
+                    && (title == "opensessions-sidebar" || command.starts_with("opensessions")))
+                .then(|| pane.to_string())
             }) {
                 return pane;
             }
