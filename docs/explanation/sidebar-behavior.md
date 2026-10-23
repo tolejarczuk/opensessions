@@ -60,9 +60,9 @@ Expected shutdown behavior:
 
 ### Session switching keeps the sidebar in control
 
-Clicking a tmux session in the sidebar should switch to that session and leave focus in that session's sidebar pane. This keeps the global sidebar interaction continuous while navigating.
+Clicking a tmux session in the sidebar should switch to that session and keep the global sidebar interaction continuous. Pane focus follows `@opensessions-switch-focus`: with the default `main`, a switch that lands on a remembered sidebar pane rehomes focus to the previously active pane of that window; with `sidebar`, focus stays in the destination sidebar pane. The rehome is a direct tmux hook command on `client-session-changed` and `after-select-window` (not a background job), so it settles with the switch and cannot race a later explicit sidebar focus.
 
-Agent-row activation is different: it may switch sessions first, then intentionally focus the target agent pane.
+Agent-row activation is different: it may switch sessions first, then intentionally focus the target agent pane. Explicit sidebar focus (`focus.sh`, mouse clicks) is never rehomed by the switch policy.
 
 ### Pane exits must not let tmux steal sidebar space
 
@@ -142,7 +142,8 @@ That means:
 - switching must not reset the width to an older value
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - switching immediately after any manual/sidebar/tmux resize still converges to Fixed Sidebar Width; no observed pane width is adopted as the new width
-- switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
+- switching from a sidebar session row follows `@opensessions-switch-focus` (default `main`): focus rehomes to the previously active pane, and a remembered sidebar pane never keeps focus after the switch unless the policy is `sidebar`
+- the switch-focus rehome runs in-band as a direct tmux hook command, so an explicit sidebar focus that follows the switch is never overridden by it
 
 The sidebar session list has one durable local active row: this tmux client's confirmed active session. The keyboard-focused row may temporarily diverge while the user browses with `j`/`k`/arrow keys, but that temporary selection is local-only and must not be server-synced. `Enter` switches to the temporary selection and keeps that row visible as the pending switch target until `YourSession`/pane identity confirms the new context; it must not snap back to the old active row for an intermediate frame. `Tab`/`Shift-Tab` are the only keys that immediately switch to the next/previous visible session without first moving temporary focus. Mouse clicks on sessions also make the clicked concrete session the pending focus target. In all cases, the durable active row stays on the confirmed active session until confirmation.
 

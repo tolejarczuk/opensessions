@@ -1,5 +1,6 @@
 const SIDEBAR_PANE_TITLE: &str = "opensessions-sidebar";
 const SIDEBAR_WIDTH_OPTION: &str = "@opensessions_width";
+const SWITCH_FOCUS_OPTION: &str = "@opensessions-switch-focus";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxVar {
@@ -8,6 +9,7 @@ pub enum TmuxVar {
     PaneWidth,
     WindowPanes,
     SidebarWidthOption,
+    SwitchFocusOption,
 }
 
 impl TmuxVar {
@@ -18,6 +20,7 @@ impl TmuxVar {
             Self::PaneWidth => "pane_width",
             Self::WindowPanes => "window_panes",
             Self::SidebarWidthOption => SIDEBAR_WIDTH_OPTION,
+            Self::SwitchFocusOption => SWITCH_FOCUS_OPTION,
         }
     }
 
@@ -179,6 +182,33 @@ fn synchronous_sidebar_width_repair_command() -> String {
     run_shell_command(&format!("{} || true", sidebar_width_repair_pipeline()), false)
 }
 
+/// Native tmux hook command: when a session or window switch lands on a
+/// sidebar pane, hand focus back to the previously active pane. This is a
+/// direct tmux command (not a `run-shell` job), so it runs in-band while the
+/// switch is processed and cannot race a later explicit sidebar focus. The
+/// `@opensessions-switch-focus` option set to `sidebar` disables the rehome
+/// and preserves the legacy behaviour. Formats stay single-quoted so tmux
+/// expands them when the hook fires, not when it is installed.
+pub fn switch_focus_hook_command() -> String {
+    format!(
+        "if-shell -F '{}' 'select-pane -l'",
+        switch_focus_condition().render(),
+    )
+}
+
+fn switch_focus_condition() -> TmuxFormat {
+    TmuxFormat::and([
+        TmuxFormat::eq(
+            TmuxVar::PaneTitle.format(),
+            TmuxFormat::literal(SIDEBAR_PANE_TITLE),
+        ),
+        TmuxFormat::neq(
+            TmuxVar::SwitchFocusOption.format(),
+            TmuxFormat::literal("sidebar"),
+        ),
+    ])
+}
+
 pub fn pane_exited_hook_command(base: &str) -> String {
     format!(
         "{} ; {} ; {}",
@@ -290,6 +320,14 @@ mod tests {
         assert_eq!(
             sidebar_width_repair_pipeline(),
             "tmux -S #{socket_path} list-panes -a -f '##{&&:##{>:##{window_panes},1},##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"
+        );
+    }
+
+    #[test]
+    fn renders_switch_focus_hook_with_sidebar_title_and_option_guards() {
+        assert_eq!(
+            switch_focus_hook_command(),
+            "if-shell -F '#{&&:#{==:#{pane_title},opensessions-sidebar},#{!=:#{@opensessions-switch-focus},sidebar}}' 'select-pane -l'"
         );
     }
 

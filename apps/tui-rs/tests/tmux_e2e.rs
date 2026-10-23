@@ -414,6 +414,57 @@ fn tmux_sidebar_notifies_for_unfocused_agent_attention() {
 }
 
 #[test]
+fn tmux_sidebar_session_switch_focuses_the_main_pane() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-switch-focus-main");
+
+    let destination = "effect-ts";
+    let sidebar = lab.sidebar_pane(destination);
+    let main = lab
+        .tmux([
+            "list-panes",
+            "-t",
+            destination,
+            "-F",
+            "#{pane_id} #{pane_title}",
+        ])
+        .lines()
+        .find(|line| !line.contains("opensessions-sidebar"))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .expect("destination main pane");
+
+    // Leave the destination sidebar as the remembered active pane.
+    lab.tmux_ok(["switch-client", "-t", destination]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+    sleep(Duration::from_millis(250));
+
+    // Switch away and back: focus must land on the main pane, not the sidebar.
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    sleep(Duration::from_millis(250));
+    lab.tmux_ok(["switch-client", "-t", destination]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lab.active_pane() != main && Instant::now() < deadline {
+        sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        lab.active_pane(),
+        main,
+        "session switch must focus the destination main pane instead of the sidebar",
+    );
+
+    // Explicit sidebar focus still works and sticks.
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+    sleep(Duration::from_millis(500));
+    assert_eq!(
+        lab.active_pane(),
+        sidebar,
+        "explicit sidebar focus must never be rehomed",
+    );
+}
+
+#[test]
 fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pane() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-agent-seen-state-machine");

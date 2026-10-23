@@ -7,7 +7,7 @@ use crate::mux::{
 };
 use crate::tmux_scripting::{
     delayed_http_hook_command, hook_context_format, http_hook_command, pane_died_hook_command,
-    pane_exited_hook_command, sidebar_width_repair_pipeline,
+    pane_exited_hook_command, sidebar_width_repair_pipeline, switch_focus_hook_command,
 };
 
 const SEP: &str = "\t";
@@ -508,6 +508,7 @@ impl MuxProvider for TmuxProvider {
         let base = format!("http://{server_host}:{server_port}");
         let hook_context = hook_context_format();
         let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true);
+        let switch_focus_cmd = switch_focus_hook_command();
         let refresh_cmd = http_hook_command(&base, "/refresh", None, true);
         let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
         let pane_exited_cmd = pane_exited_hook_command(&base);
@@ -525,13 +526,15 @@ impl MuxProvider for TmuxProvider {
 
         self.client.set_global_hook(
             "client-session-changed",
-            &format!("{focus_cmd} ; {ensure_cmd}"),
+            &format!("{switch_focus_cmd} ; {focus_cmd} ; {ensure_cmd}"),
         );
         self.client.set_global_hook("after-select-pane", &focus_cmd);
         self.client.set_global_hook("session-created", &refresh_cmd);
         self.client.set_global_hook("session-closed", &refresh_cmd);
-        self.client
-            .set_global_hook("after-select-window", &ensure_cmd);
+        self.client.set_global_hook(
+            "after-select-window",
+            &format!("{switch_focus_cmd} ; {ensure_cmd}"),
+        );
         self.client.set_global_hook("after-new-window", &ensure_cmd);
         self.client
             .set_global_hook("client-resized", &client_resized_cmd);
