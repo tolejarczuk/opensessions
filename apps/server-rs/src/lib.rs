@@ -1756,6 +1756,13 @@ async fn run_tmux_state_poll_loop(
             _ = interval.tick() => {
                 // Hooks correct tmux layout churn immediately; this slower poll
                 // is only a backstop for missed external tmux changes.
+                //
+                // Dead sidebar panes are reaped here too: clients and pane-exit
+                // hooks normally remove them, but a killed client or a missed
+                // hook must not leave a remain-on-exit corpse in the layout.
+                for provider in &source.providers {
+                    provider.reap_dead_sidebar_panes();
+                }
 
                 let snapshot = source.snapshot_json();
                 // Hash the snapshot ignoring the per-tick `ts` field so that

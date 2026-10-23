@@ -104,6 +104,7 @@ pub struct PaneInfo {
     pub height: u16,
     pub left: u16,
     pub right: u16,
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +746,19 @@ impl MuxProvider for TmuxProvider {
         self.kill_orphaned_sidebar_panes_with_fallbacks(&HashMap::new());
     }
 
+    fn reap_dead_sidebar_panes(&self) {
+        // remain-on-exit keeps a crashed or disconnected sidebar pane around as
+        // a dead corpse until something removes it. Clients clean up their own
+        // pane on exit and pane-exit hooks normally handle the rest; this is a
+        // periodic backstop for cases where neither fired (killed client,
+        // missed hook). Only dead panes titled as sidebars are touched.
+        for pane in self.client.list_panes(PaneScope::All) {
+            if pane.dead && pane.title == "opensessions-sidebar" {
+                self.client.kill_pane(&pane.id);
+            }
+        }
+    }
+
     fn kill_orphaned_sidebar_panes_with_fallbacks(
         &self,
         fallback_sessions: &HashMap<String, String>,
@@ -854,7 +868,7 @@ fn client_format() -> &'static str {
 }
 
 fn pane_format() -> &'static str {
-    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}"
 }
 
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
@@ -968,7 +982,7 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
         .filter(|line| !line.is_empty())
         .filter_map(|line| {
             let parts = split(line);
-            if parts.len() < 15 {
+            if parts.len() < 16 {
                 return None;
             }
             Some(PaneInfo {
@@ -987,6 +1001,7 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
                 height: parse_u16(&parts, 12),
                 left: parse_u16(&parts, 13),
                 right: parse_u16(&parts, 14),
+                dead: part(&parts, 15) == "1",
             })
         })
         .collect()

@@ -37,6 +37,28 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
+/// A sidebar client owns its pane. When the client exits for any reason (quit
+/// frame, server disconnect, startup failure, panic unwind) the pane must not
+/// linger as a remain-on-exit corpse, so kill it best-effort on drop. tmux
+/// pane ids are never reused, so a late cleanup cannot hit a respawned
+/// sidebar.
+struct PaneCleanupGuard {
+    pane_id: Option<String>,
+}
+
+impl Drop for PaneCleanupGuard {
+    fn drop(&mut self) {
+        let Some(pane_id) = self.pane_id.as_deref() else {
+            return;
+        };
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", pane_id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
 /// so live focus/agent-state issues can be diagnosed without extra env setup;
 /// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
@@ -83,6 +105,9 @@ async fn main() -> Result<()> {
     };
 
     let identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
+    let _pane_cleanup = PaneCleanupGuard {
+        pane_id: identity.as_ref().map(|identity| identity.pane_id.clone()),
+    };
 
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"

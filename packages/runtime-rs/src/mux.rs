@@ -126,6 +126,8 @@ pub trait MuxProvider: Send + Sync {
     fn prepare_sidebar_window(&self, _window_id: &str) {}
     fn resize_sidebar_pane(&self, _pane_id: &str, _width: u16) {}
     fn kill_orphaned_sidebar_panes(&self) {}
+
+    fn reap_dead_sidebar_panes(&self) {}
     fn kill_orphaned_sidebar_panes_with_fallbacks(
         &self,
         _fallback_sessions: &HashMap<String, String>,
