@@ -70,21 +70,36 @@ bind_global_index_keys() {
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
 
-# --- Bootstrap: kill stale server if version or install path changed ---
+# --- Bootstrap: kill stale server if version, install path, or binaries changed ---
 VERSION_FILE="${PID_FILE%.pid}.version"
-CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}"
+
+# Include the server binary's mtime so a rebuilt or re-downloaded binary
+# restarts a stale server even when package.json did not change.
+BIN_STAMP=""
+if [ -x "$CURRENT_DIR/bin/opensessions-server" ]; then
+  BIN_STAMP="$(stat -c %Y "$CURRENT_DIR/bin/opensessions-server" 2>/dev/null \
+    || stat -f %m "$CURRENT_DIR/bin/opensessions-server" 2>/dev/null \
+    || true)"
+fi
+CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}:${BIN_STAMP}"
 RUNNING_VERSION=""
 [ -f "$VERSION_FILE" ] && RUNNING_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
 
-if [ "$CURRENT_VERSION" != "$RUNNING_VERSION" ]; then
-  if [ -f "$PID_FILE" ]; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null || true
-    rm -f "$PID_FILE"
+# Only kill the pid when it still belongs to an opensessions server; a stale
+# pid file must never take down an unrelated process.
+kill_stale_server() {
+  [ -f "$PID_FILE" ] || return 0
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  if [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'opensessions-server'; then
+    kill "$pid" 2>/dev/null || true
   fi
+  rm -f "$PID_FILE"
+}
 
+if [ "$CURRENT_VERSION" != "$RUNNING_VERSION" ]; then
+  kill_stale_server
   echo -n "$CURRENT_VERSION" > "$VERSION_FILE"
-
-  : # Version file is only used to restart stale server processes.
 fi
 
 # --- Bind tmux shortcuts ---

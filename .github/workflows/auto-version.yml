@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   version:
@@ -65,3 +66,9 @@ jobs:
           git commit -m "chore: bump version to $NEXT [skip ci]"
           git tag "v$NEXT"
           git push origin main --tags
+
+      - name: Trigger release build
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref "v${{ steps.version.outputs.next }}"

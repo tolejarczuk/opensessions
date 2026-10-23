@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Tag pushes made with the default GITHUB_TOKEN do not trigger workflows,
+  # so the auto-version workflow dispatches this one explicitly.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

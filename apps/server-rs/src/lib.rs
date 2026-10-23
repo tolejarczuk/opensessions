@@ -2064,6 +2064,7 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
         .or_else(|| run_query(session_message_query).filter(|output| output.status.success()))
         .or_else(|| run_query(legacy_query).filter(|output| output.status.success()));
     let Some(output) = output else {
+        log_opencode_scan_failure(&db_path);
         return;
     };
 
@@ -2085,6 +2086,21 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
         ) {
             snapshots.push(snapshot);
         }
+    }
+}
+
+/// The OpenCode scanner shells out to the `sqlite3` CLI and silently yields
+/// nothing when that binary is missing or when every known schema fails to
+/// query, which is indistinguishable from "no recent sessions". Log it once
+/// per process so a broken setup is diagnosable from the debug log.
+fn log_opencode_scan_failure(db_path: &Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        debug_log(format!(
+            "scan_opencode_sessions: no sqlite3 query succeeded for {} (is `sqlite3` installed? did the OpenCode schema change?)",
+            db_path.display()
+        ));
     }
 }
 
