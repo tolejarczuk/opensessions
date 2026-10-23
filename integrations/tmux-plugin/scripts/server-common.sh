@@ -31,6 +31,7 @@ PORT_BASE=22000
 TMUX_OPENSESSIONS_PORT="$(tmux show-environment -g OPENSESSIONS_PORT 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_HOST="$(tmux show-environment -g OPENSESSIONS_HOST 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_PID_FILE="$(tmux show-environment -g OPENSESSIONS_PID_FILE 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_NOTIFICATIONS="$(tmux show-environment -g OPENSESSIONS_NOTIFICATIONS 2>/dev/null | cut -d= -f2)"
 
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
@@ -137,6 +138,7 @@ ensure_server() {
   OPENSESSIONS_PORT="$PORT" \
   OPENSESSIONS_PID_FILE="$PID_FILE" \
   OPENSESSIONS_DIR="$PLUGIN_DIR" \
+  OPENSESSIONS_NOTIFICATIONS="$TMUX_OPENSESSIONS_NOTIFICATIONS" \
     "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 
   attempt=0

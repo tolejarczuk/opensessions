@@ -47,6 +47,7 @@ get_option() {
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
+NOTIFICATIONS=$(get_option "@opensessions-notifications" "on")
 COMMAND_TABLE="opensessions"
 
 bind_global_key() {
@@ -68,6 +69,7 @@ bind_global_index_keys() {
 
 # Export so scripts can read them
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
+tmux set-environment -g OPENSESSIONS_NOTIFICATIONS "$NOTIFICATIONS"
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
 
 # --- Bootstrap: kill stale server if version, install path, or binaries changed ---
@@ -81,7 +83,7 @@ if [ -x "$CURRENT_DIR/bin/opensessions-server" ]; then
     || stat -f %m "$CURRENT_DIR/bin/opensessions-server" 2>/dev/null \
     || true)"
 fi
-CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}:${BIN_STAMP}"
+CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}:${BIN_STAMP}:${NOTIFICATIONS}"
 RUNNING_VERSION=""
 [ -f "$VERSION_FILE" ] && RUNNING_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
 

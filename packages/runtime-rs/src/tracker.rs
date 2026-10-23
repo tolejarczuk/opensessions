@@ -84,6 +84,19 @@ impl AgentTracker {
             .unwrap_or_default()
     }
 
+    /// Pane id of a specific agent instance, if the tracker knows one. Used to
+    /// decide whether an attention transition happened while its pane was
+    /// focused.
+    pub fn instance_pane_id(
+        &self,
+        session: &str,
+        agent: &str,
+        thread_id: Option<&str>,
+    ) -> Option<String> {
+        let key = instance_key(agent, thread_id);
+        self.instances.get(session)?.get(&key)?.pane_id.clone()
+    }
+
     pub fn mark_seen(&mut self, session: &str) -> bool {
         let had_unseen = self.is_unseen(session);
         if !had_unseen {

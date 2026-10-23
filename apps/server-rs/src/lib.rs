@@ -22,7 +22,7 @@ use opensessions_runtime::config::{
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
-use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
+use opensessions_runtime::mux::{ActiveWindow, ClientFocus, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
@@ -252,6 +252,159 @@ pub trait GitCommandRunner: Send + Sync + 'static {
     fn git_info_output(&self, dir: &str) -> String;
 }
 
+/// Delivers agent desktop notifications. Best effort: implementations must
+/// never block the caller or panic when no notification service is available.
+pub trait AgentNotifier: Send + Sync + 'static {
+    fn notify(&self, title: &str, body: &str);
+}
+
+/// Desktop notifications through the platform's native command
+/// (`notify-send` on Linux, `osascript` on macOS). `OPENSESSIONS_NOTIFY_COMMAND`
+/// overrides the command: it is invoked through `sh -c` with the title and body
+/// appended as two arguments. Failures are logged and otherwise ignored.
+#[derive(Debug, Default)]
+pub struct DesktopNotifier;
+
+impl AgentNotifier for DesktopNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        #[cfg(unix)]
+        if let Some(command) = configured_notify_command() {
+            if let Err(err) = spawn_custom_notification(&command, title, body) {
+                debug_log(format!(
+                    "agent-notify: failed to spawn custom notification command: {err}"
+                ));
+            }
+            return;
+        }
+        if let Err(err) = spawn_desktop_notification(title, body) {
+            debug_log(format!(
+                "agent-notify: failed to spawn notification command: {err}"
+            ));
+        }
+    }
+}
+
+fn configured_notify_command() -> Option<String> {
+    std::env::var("OPENSESSIONS_NOTIFY_COMMAND")
+        .ok()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+}
+
+#[cfg(unix)]
+fn spawn_custom_notification(command: &str, title: &str, body: &str) -> std::io::Result<()> {
+    process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("{command} \"$1\" \"$2\""),
+            "opensessions-notify",
+            title,
+            body,
+        ])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_desktop_notification(title: &str, body: &str) -> std::io::Result<()> {
+    process::Command::new("notify-send")
+        .args(["--app-name", "opensessions", title, body])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_desktop_notification(title: &str, body: &str) -> std::io::Result<()> {
+    process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!("display notification {body:?} with title {title:?}"),
+        ])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn spawn_desktop_notification(_title: &str, _body: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// How an agent attention state should be announced on the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAttentionClass {
+    Finished,
+    NeedsAttention,
+}
+
+fn agent_attention_class(status: AgentStatus) -> Option<AgentAttentionClass> {
+    match status {
+        AgentStatus::Done => Some(AgentAttentionClass::Finished),
+        AgentStatus::Waiting | AgentStatus::Error => Some(AgentAttentionClass::NeedsAttention),
+        _ => None,
+    }
+}
+
+const NOTIFICATION_PROMPT_MAX_CHARS: usize = 120;
+
+fn truncate_notification_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn format_agent_notification(
+    agent: &str,
+    class: AgentAttentionClass,
+    thread_name: Option<&str>,
+    last_user_prompt: Option<&str>,
+    session: &str,
+) -> (String, String) {
+    let title = match class {
+        AgentAttentionClass::Finished => format!("{agent} finished"),
+        AgentAttentionClass::NeedsAttention => format!("{agent} needs attention"),
+    };
+    let subject = thread_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(session);
+    let mut body = subject.to_string();
+    if let Some(prompt) = last_user_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body.push('\n');
+        body.push_str(&truncate_notification_text(
+            prompt,
+            NOTIFICATION_PROMPT_MAX_CHARS,
+        ));
+    }
+    (title, body)
+}
+
+fn notification_instance_key(session: &str, agent: &str, thread_id: Option<&str>) -> String {
+    format!("{session}\u{0}{agent}\u{0}{}", thread_id.unwrap_or(""))
+}
+
+fn notifications_disabled_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "off" | "0" | "false" | "no"
+    )
+}
+
 #[derive(Debug, Default)]
 struct SystemPortCommandRunner;
 
@@ -356,6 +509,15 @@ pub struct ReadOnlyMuxStateSource {
     focused_session: Mutex<Option<String>>,
     focused_pane_by_session: Mutex<HashMap<String, String>>,
     focused_client_tty: Mutex<Option<String>>,
+    /// Focus of the tracked client, refreshed on every state sync. Notifications
+    /// use this instead of `focused_pane_by_session`, whose per-session entries
+    /// go stale when the client switches to another session.
+    last_client_focus: Mutex<Option<ClientFocus>>,
+    agent_notifier: Arc<dyn AgentNotifier>,
+    notifications_enabled: bool,
+    /// Last attention status announced per agent instance, so unchanged states
+    /// do not repeat notifications.
+    last_notified_agent_status: Mutex<HashMap<String, AgentStatus>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
@@ -381,6 +543,11 @@ pub fn default_state_source_from_env(
         if let Some(height) = config.and_then(|config| config.detail_panel_height) {
             source = source.with_detail_panel_height(height);
         }
+        if let Some(value) = env("OPENSESSIONS_NOTIFICATIONS")
+            && notifications_disabled_value(&value)
+        {
+            source = source.with_notifications_enabled(false);
+        }
         return Some(source);
     }
 
@@ -401,6 +568,10 @@ impl ReadOnlyMuxStateSource {
             focused_session: Mutex::new(None),
             focused_pane_by_session: Mutex::new(HashMap::new()),
             focused_client_tty: Mutex::new(None),
+            last_client_focus: Mutex::new(None),
+            agent_notifier: Arc::new(DesktopNotifier),
+            notifications_enabled: true,
+            last_notified_agent_status: Mutex::new(HashMap::new()),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
@@ -483,6 +654,16 @@ impl ReadOnlyMuxStateSource {
         self
     }
 
+    pub fn with_notifier(mut self, notifier: Arc<dyn AgentNotifier>) -> Self {
+        self.agent_notifier = notifier;
+        self
+    }
+
+    pub fn with_notifications_enabled(mut self, enabled: bool) -> Self {
+        self.notifications_enabled = enabled;
+        self
+    }
+
     pub fn with_git_command_runner(mut self, runner: Arc<dyn GitCommandRunner>) -> Self {
         self.git_command_runner = runner;
         self
@@ -491,9 +672,13 @@ impl ReadOnlyMuxStateSource {
     fn sync_agent_pane_presence(&self) -> bool {
         let mut presence_by_session = Vec::new();
         let mut focused_agent_panes = HashMap::<String, String>::new();
+        let mut latest_client_focus: Option<ClientFocus> = None;
         let focused_client_tty = self.focused_client_tty.lock().unwrap().clone();
         for provider in &self.providers {
             let client_focus = provider.get_client_focus(focused_client_tty.as_deref());
+            if latest_client_focus.is_none() {
+                latest_client_focus = client_focus.clone();
+            }
             for session in provider.list_sessions() {
                 let pane_agents = provider
                     .list_agent_panes(&session.name)
@@ -524,6 +709,7 @@ impl ReadOnlyMuxStateSource {
         }
 
         let mut changed = false;
+        *self.last_client_focus.lock().unwrap() = latest_client_focus;
         let mut tracker = self.agent_tracker.lock().unwrap();
         for (session, pane_agents) in presence_by_session {
             changed = tracker.apply_pane_presence(&session, pane_agents) || changed;
@@ -578,6 +764,12 @@ impl ReadOnlyMuxStateSource {
         if context.client_tty.is_some() {
             *self.focused_client_tty.lock().unwrap() = context.client_tty.clone();
         }
+        *self.last_client_focus.lock().unwrap() = Some(ClientFocus {
+            client_tty: context.client_tty.clone(),
+            session_name: context.session.clone(),
+            window_id: context.window_id.clone(),
+            pane_id: pane_id.to_string(),
+        });
         self.focused_pane_by_session
             .lock()
             .unwrap()
@@ -592,6 +784,60 @@ impl ReadOnlyMuxStateSource {
             context.session, pane_id,
         ));
         changed
+    }
+
+    /// Announce agent attention states (finished / needs attention) on the
+    /// desktop. Suppressed when the agent's pane is the client's focused pane,
+    /// when the event only seeds the startup baseline, or when the same status
+    /// was already announced for this agent instance.
+    fn maybe_notify_agent_attention(
+        &self,
+        session: &str,
+        agent: &str,
+        thread_id: Option<&str>,
+        status: AgentStatus,
+        thread_name: Option<&str>,
+        last_user_prompt: Option<&str>,
+        seeded: bool,
+    ) {
+        let key = notification_instance_key(session, agent, thread_id);
+        let Some(class) = agent_attention_class(status) else {
+            self.last_notified_agent_status.lock().unwrap().remove(&key);
+            return;
+        };
+        {
+            let mut last_notified = self.last_notified_agent_status.lock().unwrap();
+            if seeded || !self.notifications_enabled {
+                last_notified.insert(key, status);
+                return;
+            }
+            if last_notified.get(&key) == Some(&status) {
+                return;
+            }
+            let pane_id = self
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .instance_pane_id(session, agent, thread_id);
+            let focus = self.last_client_focus.lock().unwrap().clone();
+            if let (Some(pane_id), Some(focus)) = (pane_id.as_deref(), focus.as_ref())
+                && focus.session_name == session
+                && focus.pane_id == pane_id
+            {
+                debug_log(format!(
+                    "agent-notify: suppressed focused session={session} pane={pane_id} agent={agent} status={status:?}",
+                ));
+                last_notified.insert(key, status);
+                return;
+            }
+            last_notified.insert(key, status);
+        }
+        let (title, body) =
+            format_agent_notification(agent, class, thread_name, last_user_prompt, session);
+        debug_log(format!(
+            "agent-notify: session={session} agent={agent} thread={thread_id:?} title={title:?}",
+        ));
+        self.agent_notifier.notify(&title, &body);
     }
 }
 
@@ -1116,26 +1362,30 @@ impl ReadOnlyMuxStateSource {
             .get("paneId")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let thread_id = body
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let thread_name = body
+            .get("threadName")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let last_user_prompt = body
+            .get("lastUserPrompt")
+            .or_else(|| body.get("last_user_prompt"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let event_pane_id = pane_id.clone();
         let event_session = session.clone();
+        let event_agent = agent.clone();
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
             session,
             status,
             ts,
-            thread_id: body
-                .get("threadId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            thread_name: body
-                .get("threadName")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            last_user_prompt: body
-                .get("lastUserPrompt")
-                .or_else(|| body.get("last_user_prompt"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
+            thread_id: thread_id.clone(),
+            thread_name: thread_name.clone(),
+            last_user_prompt: last_user_prompt.clone(),
             unseen: None,
             liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
             pane_id,
@@ -1157,10 +1407,19 @@ impl ReadOnlyMuxStateSource {
                 .unwrap()
                 .mark_pane_seen(&event_session, &pane_id);
         }
+        self.maybe_notify_agent_attention(
+            &event_session,
+            &event_agent,
+            thread_id.as_deref(),
+            status,
+            thread_name.as_deref(),
+            last_user_prompt.as_deref(),
+            false,
+        );
         Ok(())
     }
 
-    fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
+    fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot, seed: bool) -> bool {
         if snapshot.status == AgentStatus::Idle {
             debug_log(format!(
                 "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
@@ -1207,7 +1466,14 @@ impl ReadOnlyMuxStateSource {
             pane_id: None,
             liveness: None,
         };
-        self.agent_tracker.lock().unwrap().apply_event(event);
+        {
+            let mut tracker = self.agent_tracker.lock().unwrap();
+            if seed {
+                tracker.apply_seed_event(event);
+            } else {
+                tracker.apply_event(event);
+            }
+        }
         if let Some(pane_id) = focused_pane {
             let changed = self
                 .agent_tracker
@@ -1219,6 +1485,15 @@ impl ReadOnlyMuxStateSource {
                 session, pane_id, snapshot.agent, snapshot.thread_id, snapshot.thread_name,
             ));
         }
+        self.maybe_notify_agent_attention(
+            &session,
+            snapshot.agent,
+            snapshot.thread_id.as_deref(),
+            snapshot.status,
+            snapshot.thread_name.as_deref(),
+            snapshot.last_user_prompt.as_deref(),
+            seed,
+        );
         true
     }
 
@@ -1834,6 +2109,9 @@ async fn run_agent_watcher_loop(
     let mut interval = tokio::time::interval(Duration::from_millis(AGENT_WATCHER_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    // The first scan only seeds the baseline: pre-existing attention states
+    // must not produce desktop notifications.
+    let mut first_pass = true;
 
     loop {
         tokio::select! {
@@ -1859,7 +2137,7 @@ async fn run_agent_watcher_loop(
                     let agent = snapshot.agent.to_string();
                     let status = snapshot.status;
                     let thread_name = snapshot.thread_name.clone();
-                    if source.apply_agent_watcher_snapshot(snapshot) {
+                    if source.apply_agent_watcher_snapshot(snapshot, first_pass) {
                         debug_log(format!(
                             "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
                         ));
@@ -1871,6 +2149,7 @@ async fn run_agent_watcher_loop(
                         ));
                     }
                 }
+                first_pass = false;
             }
         }
     }
@@ -3161,5 +3440,295 @@ mod tests {
         assert_eq!(snapshot.last_user_prompt, None);
         assert_eq!(snapshot.status, AgentStatus::Running);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // --- Agent desktop notifications ---
+
+    use opensessions_runtime::mux::{ClientFocus, MuxSessionInfo};
+
+    struct RecordingNotifier {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingNotifier {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl AgentNotifier for RecordingNotifier {
+        fn notify(&self, title: &str, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((title.to_string(), body.to_string()));
+        }
+    }
+
+    struct FakeMuxProvider {
+        sessions: Vec<MuxSessionInfo>,
+    }
+
+    impl MuxProvider for FakeMuxProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.sessions.clone()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+
+        fn get_session_dir(&self, name: &str) -> String {
+            self.sessions
+                .iter()
+                .find(|session| session.name == name)
+                .map(|session| session.dir.clone())
+                .unwrap_or_default()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+
+        fn kill_session(&self, _name: &str) {}
+
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+        fn cleanup_hooks(&self) {}
+    }
+
+    fn notification_source() -> (ReadOnlyMuxStateSource, Arc<RecordingNotifier>) {
+        let notifier = RecordingNotifier::new();
+        let provider = Arc::new(FakeMuxProvider {
+            sessions: vec![MuxSessionInfo {
+                name: "work".to_string(),
+                created_at: 0,
+                dir: "/repo/work".to_string(),
+                windows: 1,
+            }],
+        });
+        let source = ReadOnlyMuxStateSource::new(vec![provider]).with_notifier(notifier.clone());
+        (source, notifier)
+    }
+
+    fn opencode_snapshot(status: AgentStatus, ts: u64) -> AgentWatcherSnapshot {
+        AgentWatcherSnapshot {
+            agent: "opencode",
+            thread_id: Some("ses_1".to_string()),
+            thread_name: Some("Fix the tests".to_string()),
+            last_user_prompt: Some("please fix the failing tests".to_string()),
+            project_dir: Some("/repo/work".to_string()),
+            status,
+            ts,
+        }
+    }
+
+    fn stamp_agent_pane(source: &ReadOnlyMuxStateSource, pane_id: &str) {
+        source.agent_tracker.lock().unwrap().apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "opencode".to_string(),
+                pane_id: pane_id.to_string(),
+                active: true,
+                thread_id: Some("ses_1".to_string()),
+                thread_name: Some("Fix the tests".to_string()),
+            }],
+        );
+    }
+
+    fn focus_pane(source: &ReadOnlyMuxStateSource, pane_id: &str) {
+        *source.last_client_focus.lock().unwrap() = Some(ClientFocus {
+            client_tty: Some("/dev/pts/1".to_string()),
+            session_name: "work".to_string(),
+            window_id: "@1".to_string(),
+            pane_id: pane_id.to_string(),
+        });
+    }
+
+    #[test]
+    fn finished_agent_notifies_with_subject_and_prompt() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 100), false);
+
+        assert_eq!(
+            notifier.calls(),
+            vec![(
+                "opencode finished".to_string(),
+                "Fix the tests\nplease fix the failing tests".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn notification_suppressed_when_agent_pane_is_focused() {
+        let (source, notifier) = notification_source();
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Running, 100), false);
+        stamp_agent_pane(&source, "%1");
+        focus_pane(&source, "%1");
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 200), false);
+
+        assert!(notifier.calls().is_empty());
+    }
+
+    #[test]
+    fn notification_sent_when_another_pane_is_focused() {
+        let (source, notifier) = notification_source();
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Running, 100), false);
+        stamp_agent_pane(&source, "%1");
+        focus_pane(&source, "%9");
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 200), false);
+
+        assert_eq!(notifier.calls().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_attention_status_does_not_repeat_notifications() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 100), false);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 200), false);
+
+        assert_eq!(notifier.calls().len(), 1);
+    }
+
+    #[test]
+    fn notification_rearms_after_agent_runs_again() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Running, 100), false);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 200), false);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Running, 300), false);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 400), false);
+
+        assert_eq!(notifier.calls().len(), 2);
+    }
+
+    #[test]
+    fn seeded_baseline_is_silent_until_agent_changes_state() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 100), true);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 200), false);
+        assert!(notifier.calls().is_empty());
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Running, 300), false);
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 400), false);
+        assert_eq!(notifier.calls().len(), 1);
+    }
+
+    #[test]
+    fn notifications_can_be_disabled() {
+        let (source, notifier) = notification_source();
+        let source = source.with_notifications_enabled(false);
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Done, 100), false);
+
+        assert!(notifier.calls().is_empty());
+    }
+
+    #[test]
+    fn waiting_agents_notify_needs_attention() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Waiting, 100), false);
+
+        assert_eq!(notifier.calls()[0].0, "opencode needs attention");
+    }
+
+    #[test]
+    fn error_agents_notify_needs_attention() {
+        let (source, notifier) = notification_source();
+
+        source.apply_agent_watcher_snapshot(opencode_snapshot(AgentStatus::Error, 100), false);
+
+        assert_eq!(notifier.calls()[0].0, "opencode needs attention");
+    }
+
+    #[test]
+    fn external_agent_events_notify() {
+        let (source, notifier) = notification_source();
+        let body = serde_json::json!({
+            "agent": "claude",
+            "status": "waiting",
+            "tmuxSession": "work",
+            "threadId": "thread-1",
+            "threadName": "Review the diff",
+            "lastUserPrompt": "review the diff",
+        });
+
+        source.apply_agent_event(&body).expect("event applies");
+
+        assert_eq!(
+            notifier.calls(),
+            vec![(
+                "claude needs attention".to_string(),
+                "Review the diff\nreview the diff".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn notification_body_falls_back_to_session() {
+        let (source, notifier) = notification_source();
+        let mut snapshot = opencode_snapshot(AgentStatus::Done, 100);
+        snapshot.thread_name = None;
+        snapshot.last_user_prompt = None;
+
+        source.apply_agent_watcher_snapshot(snapshot, false);
+
+        assert_eq!(notifier.calls()[0].1, "work");
+    }
+
+    #[test]
+    fn notification_body_truncates_long_prompts() {
+        let (source, notifier) = notification_source();
+        let mut snapshot = opencode_snapshot(AgentStatus::Done, 100);
+        snapshot.last_user_prompt = Some("x".repeat(400));
+
+        source.apply_agent_watcher_snapshot(snapshot, false);
+
+        let body = &notifier.calls()[0].1;
+        let prompt_line = body.split('\n').nth(1).expect("prompt line");
+        assert_eq!(prompt_line.chars().count(), 121); // 120 chars + ellipsis
+        assert!(prompt_line.ends_with('…'));
+    }
+
+    #[test]
+    fn notifications_default_on_and_env_off_disables_them() {
+        let with_tmux = |value: Option<&str>| {
+            let value = value.map(ToString::to_string);
+            default_state_source_from_env(|key| match key {
+                "TMUX" => Some("1".to_string()),
+                "OPENSESSIONS_NOTIFICATIONS" => value.clone(),
+                _ => None,
+            })
+            .expect("source")
+        };
+
+        assert!(with_tmux(None).notifications_enabled);
+        assert!(with_tmux(Some("on")).notifications_enabled);
+        assert!(!with_tmux(Some("off")).notifications_enabled);
+        assert!(!with_tmux(Some("0")).notifications_enabled);
     }
 }

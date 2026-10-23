@@ -373,6 +373,47 @@ fn tmux_sidebar_marks_done_event_seen_when_its_pane_is_already_focused() {
 }
 
 #[test]
+fn tmux_sidebar_notifies_for_unfocused_agent_attention() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-agent-notify");
+
+    let focused_pane = lab.spawn_agent_pane("opensessions", "Notify focus - amp - done");
+    let background_pane = lab.spawn_agent_pane("opensessions", "Notify background - amp - done");
+    assert_ne!(focused_pane, background_pane, "agent panes must differ");
+    sleep(Duration::from_millis(500));
+    lab.restart_server();
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", focused_pane.as_str()]);
+    sleep(Duration::from_millis(250));
+
+    lab.post_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "notify-focused-thread",
+        &focused_pane,
+    );
+    lab.post_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "notify-background-thread",
+        &background_pane,
+    );
+
+    let log = lab.wait_for_notify_log(|log| log.contains("amp finished"));
+    assert!(
+        log.contains("amp finished|notify-background-thread"),
+        "unfocused agent attention must notify; got:\n{log}",
+    );
+    assert!(
+        !log.contains("notify-focused-thread"),
+        "focused agent pane must not notify; got:\n{log}",
+    );
+}
+
+#[test]
 fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pane() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-agent-seen-state-machine");
@@ -1143,12 +1184,17 @@ time.sleep(300)
     fn start_server(&mut self) {
         let server = self.server_bin();
         let tmux_env = self.tmux_socket_env();
+        let notify_stub = self.write_notify_stub();
         let child = Command::new(server)
             .env("TMUX", tmux_env)
             .env("HOME", self.home_dir())
             .env("OPENSESSIONS_WIDTH", "35")
             .env("OPENSESSIONS_HOST", "127.0.0.1")
             .env("OPENSESSIONS_PORT", self.port.to_string())
+            .env(
+                "OPENSESSIONS_NOTIFY_COMMAND",
+                format!("sh {}", shell_quote(&notify_stub)),
+            )
             .env(
                 "OPENSESSIONS_DEBUG_LOG",
                 self.root.join("debug.log").to_str().unwrap(),
@@ -1318,6 +1364,41 @@ time.sleep(300)
         })
         .to_string();
         post_body(self.port, "/api/agent-event", "application/json", &body);
+    }
+
+    /// Route agent desktop notifications to a stub that appends `title|body`
+    /// lines to `<lab root>/notify.log`, so E2E runs never pop real
+    /// notifications and tests can assert on delivery.
+    fn write_notify_stub(&self) -> String {
+        let path = self.root.join("notify-stub.sh");
+        let log = self.root.join("notify.log");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> {}\n",
+                shell_quote(&log.to_string_lossy()),
+            ),
+        )
+        .expect("write notify stub");
+        path.to_string_lossy().to_string()
+    }
+
+    fn wait_for_notify_log<F>(&self, predicate: F) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let path = self.root.join("notify.log");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            if predicate(&content) {
+                return content;
+            }
+            if Instant::now() >= deadline {
+                panic!("notify log predicate not met; log:\n{content}");
+            }
+            sleep(Duration::from_millis(100));
+        }
     }
 
     fn post_watcher_like_agent_event(
