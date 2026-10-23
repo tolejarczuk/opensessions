@@ -25,5 +25,10 @@ jobs:
       - name: Build binaries used by tmux E2E
         run: cargo build --workspace --bins
 
+      - name: Show E2E environment
+        run: |
+          tmux -V
+          uname -a
+
       - name: Run tmux sidebar E2E
         run: cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture

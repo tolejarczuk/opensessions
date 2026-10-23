@@ -1837,7 +1837,10 @@ time.sleep(300)
                 return pane;
             }
             if Instant::now() >= deadline {
-                panic!("no sidebar pane found for {session}; panes:\n{output}");
+                panic!(
+                    "no sidebar pane found for {session}; panes:\n{output}\nlogs:\n{}",
+                    self.logs(),
+                );
             }
             sleep(Duration::from_millis(100));
         }
@@ -1895,7 +1898,10 @@ time.sleep(300)
                 return pane;
             }
             if Instant::now() >= deadline {
-                panic!("no sidebar pane found for {target}; panes:\n{output}");
+                panic!(
+                    "no sidebar pane found for {target}; panes:\n{output}\nlogs:\n{}",
+                    self.logs(),
+                );
             }
             sleep(Duration::from_millis(100));
         }
@@ -1961,11 +1967,14 @@ time.sleep(300)
     }
 
     fn sidebar_panes(&self) -> Vec<SidebarPane> {
+        // dead/pid are diagnostics: lingering shutdown panes are either dead
+        // corpses (remain-on-exit cleanup missed) or live processes (client
+        // never exited), and failure messages must show which.
         self.tmux([
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\t#{pane_id}\t#{pane_width}\t#{pane_current_command}\t#{pane_title}",
+            "#{session_name}\t#{pane_id}\t#{pane_width}\t#{pane_current_command}\t#{pane_title}\t#{pane_dead}\t#{pane_pid}",
         ])
         .lines()
         .filter_map(|line| {
@@ -1975,11 +1984,15 @@ time.sleep(300)
             let width = parts.next()?.parse::<u16>().ok()?;
             let command = parts.next()?;
             let title = parts.next()?;
+            let dead = parts.next()? == "1";
+            let pid = parts.next()?.parse::<u32>().ok()?;
             (title == "opensessions-sidebar" || command.starts_with("opensessions")).then(|| {
                 SidebarPane {
                     session: session.to_string(),
                     pane: pane.to_string(),
                     width,
+                    dead,
+                    pid,
                 }
             })
         })
@@ -2129,4 +2142,6 @@ struct SidebarPane {
     session: String,
     pane: String,
     width: u16,
+    dead: bool,
+    pid: u32,
 }
