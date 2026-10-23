@@ -526,14 +526,14 @@ impl MuxProvider for TmuxProvider {
 
         self.client.set_global_hook(
             "client-session-changed",
-            &format!("{switch_focus_cmd} ; {focus_cmd} ; {ensure_cmd}"),
+            &format!("{focus_cmd} ; {ensure_cmd} ; {switch_focus_cmd}"),
         );
         self.client.set_global_hook("after-select-pane", &focus_cmd);
         self.client.set_global_hook("session-created", &refresh_cmd);
         self.client.set_global_hook("session-closed", &refresh_cmd);
         self.client.set_global_hook(
             "after-select-window",
-            &format!("{switch_focus_cmd} ; {ensure_cmd}"),
+            &format!("{ensure_cmd} ; {switch_focus_cmd}"),
         );
         self.client.set_global_hook("after-new-window", &ensure_cmd);
         self.client
