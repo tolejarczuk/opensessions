@@ -169,12 +169,22 @@ pub fn close_orphan_sidebar_pipeline() -> String {
     )
 }
 
+/// Older tmux versions hand a killed pane's width to its left neighbour, so a
+/// sidebar sitting left of the dead pane grows before any background repair can
+/// run and the layout redraws with a visibly wider sidebar. Repair
+/// synchronously inside the pane-exit hooks so the sidebar is already back at
+/// Fixed Sidebar Width when the kill command returns. The trailing `|| true`
+/// keeps a failed repair from surfacing as a `returned N` run-shell error.
+fn synchronous_sidebar_width_repair_command() -> String {
+    run_shell_command(&format!("{} || true", sidebar_width_repair_pipeline()), false)
+}
+
 pub fn pane_exited_hook_command(base: &str) -> String {
     format!(
         "{} ; {} ; {}",
         run_shell_command(&close_orphan_sidebar_pipeline(), false),
         http_hook_command(base, "/pane-exited", None, false),
-        run_shell_command(&sidebar_width_repair_pipeline(), true),
+        synchronous_sidebar_width_repair_command(),
     )
 }
 
@@ -183,7 +193,7 @@ pub fn pane_died_hook_command(base: &str) -> String {
         "{} ; {} ; {}",
         run_shell_command(&close_dead_content_pane_pipeline(), false),
         http_hook_command(base, "/pane-exited", None, false),
-        run_shell_command(&sidebar_width_repair_pipeline(), true),
+        synchronous_sidebar_width_repair_command(),
     )
 }
 
@@ -299,6 +309,18 @@ mod tests {
                 || hook.contains("kill-pane -t \"\\$pane\"")
         );
         assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
-        assert!(hook.ends_with(&run_shell_command(&sidebar_width_repair_pipeline(), true)));
+        // Pane-exit hooks must repair width synchronously: older tmux gives the
+        // dead pane's space to the left neighbour and the sidebar would
+        // otherwise redraw wider before a background repair could run.
+        assert!(hook.ends_with(&synchronous_sidebar_width_repair_command()));
+        assert!(!hook.contains(&run_shell_command(&sidebar_width_repair_pipeline(), true)));
+    }
+
+    #[test]
+    fn renders_pane_died_hook_with_synchronous_width_repair() {
+        let hook = pane_died_hook_command("http://127.0.0.1:1234");
+
+        assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
+        assert!(hook.ends_with(&synchronous_sidebar_width_repair_command()));
     }
 }

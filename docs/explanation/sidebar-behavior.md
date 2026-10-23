@@ -100,7 +100,8 @@ The accepted rule set is:
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `repair-width` from a TUI client carries no width; it only asks the server to re-apply Fixed Sidebar Width after tmux resized the pane
 - `after-resize-pane` performs direct tmux repair only; it fires during our own repairs, so it must stay cheap
-- `after-resize-window`, `after-kill-pane`, `pane-exited`, and `client-resized` first try direct tmux repair, then schedule a delayed server `repair configured width` fallback for layout churn that settles after the hook starts
+- `after-kill-pane`, `pane-exited`, and `pane-died` repair width synchronously before the kill command returns; older tmux versions hand the dead pane's space to its left neighbour, so a background repair would let the sidebar visibly jump wider for a frame
+- `after-resize-window` and `client-resized` first try direct tmux repair, then schedule a delayed server `repair configured width` fallback for layout churn that settles after the hook starts
 - `pane-exited` also notifies the server for orphan-sidebar cleanup
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
