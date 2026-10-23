@@ -1751,7 +1751,9 @@ time.sleep(300)
     }
 
     fn wait_for_no_sidebar_processes(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Server shutdown drains sidebar clients asynchronously; loaded CI
+        // runners need more than a few seconds to reap every pane.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if self.sidebar_panes().is_empty() {
                 return;
@@ -1811,15 +1813,18 @@ time.sleep(300)
     }
 
     fn sidebar_pane(&self, session: &str) -> String {
-        let output = self.tmux([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_title}",
-        ]);
-        output
-            .lines()
-            .find_map(|line| {
+        // Sidebar spawns are asynchronous: the pane can briefly show the
+        // launcher shell before the sidebar binary takes over the title and
+        // command. Poll so slow CI runners are not racing a single lookup.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = self.tmux([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_title}",
+            ]);
+            if let Some(pane) = output.lines().find_map(|line| {
                 let mut parts = line.split('\t');
                 let pane_session = parts.next()?;
                 let pane = parts.next()?;
@@ -1828,8 +1833,14 @@ time.sleep(300)
                 (pane_session == session
                     && (title == "opensessions-sidebar" || command.starts_with("opensessions")))
                 .then(|| pane.to_string())
-            })
-            .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+            }) {
+                return pane;
+            }
+            if Instant::now() >= deadline {
+                panic!("no sidebar pane found for {session}; panes:\n{output}");
+            }
+            sleep(Duration::from_millis(100));
+        }
     }
 
     fn active_pane(&self) -> String {
@@ -1866,22 +1877,28 @@ time.sleep(300)
 
     fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
         let target = format!("{session}:{window}");
-        let output = self.tmux([
-            "list-panes",
-            "-t",
-            &target,
-            "-F",
-            "#{pane_id} #{pane_current_command}",
-        ]);
-        output
-            .lines()
-            .find_map(|line| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = self.tmux([
+                "list-panes",
+                "-t",
+                &target,
+                "-F",
+                "#{pane_id} #{pane_current_command}",
+            ]);
+            if let Some(pane) = output.lines().find_map(|line| {
                 let (pane, command) = line.split_once(' ')?;
                 command
                     .starts_with("opensessions")
                     .then(|| pane.to_string())
-            })
-            .unwrap_or_else(|| panic!("no sidebar pane found for {target}; panes:\n{output}"))
+            }) {
+                return pane;
+            }
+            if Instant::now() >= deadline {
+                panic!("no sidebar pane found for {target}; panes:\n{output}");
+            }
+            sleep(Duration::from_millis(100));
+        }
     }
 
     fn main_pane_in_window(&self, session: &str, window: &str) -> String {
