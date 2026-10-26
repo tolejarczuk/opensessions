@@ -762,23 +762,12 @@ fn tmux_sidebar_closes_session_cleanly_when_only_content_shell_exits() {
     let lab = started_lab("opensessions-e2e-last-shell-exit");
     lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
     lab.wait_for_client_session("effect-ts");
-    let session_names = lab.session_names();
-    let effect_index = session_names
-        .iter()
-        .position(|name| name == "effect-ts")
-        .unwrap_or_else(|| panic!("effect-ts missing from display sessions: {session_names:?}"));
-    let expected_fallback = effect_index
-        .checked_sub(1)
-        .and_then(|index| session_names.get(index))
-        .or_else(|| session_names.get(effect_index + 1))
-        .cloned()
-        .expect("effect-ts should have a fallback display session");
 
     let main = lab.main_pane("effect-ts");
     lab.tmux_ok(["send-keys", "-t", main.as_str(), "exit", "Enter"]);
 
     lab.wait_for_session_absent_without_sidebar_expansion("effect-ts", 36);
-    lab.wait_for_client_session(&expected_fallback);
+    lab.wait_for_client_session_other_than("effect-ts");
     assert!(
         !lab.logs().contains("resize-pane") && !lab.logs().contains("returned 1"),
         "last content shell exit should not surface resize-hook failures; logs:\n{}",
@@ -1549,6 +1538,34 @@ time.sleep(300)
         }
         panic!(
             "timed out waiting for client session {expected}; clients:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
+    }
+
+    /// Wait until a client is attached to any session other than `excluded`.
+    /// After a session closes, tmux itself moves the client to the next
+    /// session in tmux's own order; that need not be the neighbour in the
+    /// sidebar's grouped display order, so pinning an exact fallback name is
+    /// not stable.
+    fn wait_for_client_session_other_than(&self, excluded: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
+            if output
+                .lines()
+                .any(|line| !line.trim().is_empty() && line.trim() != excluded)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for a client to leave session {excluded}; clients:\n{}\n\nlogs:\n{}",
             self.tmux([
                 "list-clients",
                 "-F",
