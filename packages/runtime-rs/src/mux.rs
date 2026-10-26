@@ -32,6 +32,11 @@ pub struct AgentPane {
     pub active: bool,
     pub thread_id: Option<String>,
     pub thread_name: Option<String>,
+    /// True when the pane's foreground command is the agent executable itself
+    /// (e.g. `opencode`), false when the pane merely matches through its title
+    /// (bridges, wrappers, session names). Used to disambiguate agent watcher
+    /// snapshots when several tmux sessions share one directory.
+    pub exact_command_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

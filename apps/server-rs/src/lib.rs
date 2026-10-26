@@ -1525,36 +1525,55 @@ impl ReadOnlyMuxStateSource {
         // scratch sessions opened in `$HOME`), which makes the directory lookup
         // ambiguous. Without a fallback, every snapshot for this agent would be
         // dropped forever. Disambiguate by finding the candidate whose panes
-        // actually run this agent, and only proceed when exactly one qualifies.
+        // actually run this agent, and only proceed when exactly one candidate
+        // is the strongest match.
+        //
+        // Strongest means the agent executable is the pane's foreground command
+        // (`opencode`). Pane titles are weaker evidence: a session named
+        // `opencode-telegram-…` whose pane only runs a `node` bridge also looks
+        // like an opencode pane, and would otherwise tie with the real TUI in
+        // the same directory.
         let candidates = related_session_candidates(project_dir, &dir_session_map);
-        let mut resolved: Option<String> = None;
+        let mut best: Option<(u8, String)> = None;
+        let mut ambiguous = false;
         for name in &candidates {
             let Some(provider) = self.provider_for_session(name) else {
                 continue;
             };
-            let has_agent_pane = provider
+            let score = provider
                 .list_agent_panes(name)
                 .iter()
-                .any(|pane| pane.agent == snapshot.agent);
-            if !has_agent_pane {
+                .filter(|pane| pane.agent == snapshot.agent)
+                .map(|pane| if pane.exact_command_match { 2u8 } else { 1u8 })
+                .max();
+            let Some(score) = score else {
                 continue;
+            };
+            match &best {
+                Some((best_score, _)) if score < *best_score => {}
+                Some((best_score, _)) if score == *best_score => {
+                    ambiguous = true;
+                }
+                _ => {
+                    best = Some((score, name.clone()));
+                    ambiguous = false;
+                }
             }
-            if resolved.is_some() {
-                debug_log(format!(
-                    "resolve_agent_watcher_session: agent panes ambiguous agent={} project_dir={:?} candidates={candidates:?}",
-                    snapshot.agent, project_dir,
-                ));
-                return None;
-            }
-            resolved = Some(name.clone());
         }
-        if let Some(session) = &resolved {
+        if ambiguous {
             debug_log(format!(
-                "resolve_agent_watcher_session: resolved ambiguous dir via agent panes session={} agent={} project_dir={:?} candidates={candidates:?}",
-                session, snapshot.agent, project_dir,
+                "resolve_agent_watcher_session: agent panes ambiguous agent={} project_dir={:?} candidates={candidates:?}",
+                snapshot.agent, project_dir,
+            ));
+            return None;
+        }
+        if let Some((score, session)) = &best {
+            debug_log(format!(
+                "resolve_agent_watcher_session: resolved ambiguous dir via agent panes session={} agent={} score={} project_dir={:?} candidates={candidates:?}",
+                session, snapshot.agent, score, project_dir,
             ));
         }
-        resolved
+        best.map(|(_, session)| session)
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {

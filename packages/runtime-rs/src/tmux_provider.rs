@@ -661,12 +661,16 @@ impl MuxProvider for TmuxProvider {
             .into_iter()
             .filter(|pane| pane.title != "opensessions-sidebar")
             .filter_map(|pane| agent_from_pane(&pane).map(|agent| (pane, agent)))
-            .map(|(pane, agent)| AgentPane {
-                thread_name: thread_name_from_pane(&pane, &agent),
-                agent,
-                pane_id: pane.id,
-                active: pane.active,
-                thread_id: None,
+            .map(|(pane, agent)| {
+                let exact_command_match = command_matches_agent_executable(&pane.command, &agent);
+                AgentPane {
+                    thread_name: thread_name_from_pane(&pane, &agent),
+                    agent,
+                    pane_id: pane.id,
+                    active: pane.active,
+                    thread_id: None,
+                    exact_command_match,
+                }
             })
             .collect()
     }
@@ -911,6 +915,19 @@ const AGENT_ALIASES: &[(&str, &[&str])] = &[
     ("qodercli", &["qodercli", "qoderclicn", "qoder", "qodercn"]),
 ];
 
+/// True when the pane's foreground command is an executable name for `agent`
+/// (for example `opencode` or `claude`), as opposed to a title-only alias
+/// match. Title matches are legitimate (wrappers, window names) but much
+/// weaker evidence when attributing a watcher snapshot to a session.
+fn command_matches_agent_executable(command: &str, agent: &str) -> bool {
+    let command = command.to_lowercase();
+    let executable = command.rsplit('/').next().unwrap_or(&command);
+    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+    AGENT_ALIASES.iter().any(|(name, aliases)| {
+        *name == agent && aliases.iter().any(|alias| executable == *alias)
+    })
+}
+
 fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
     let title = pane.title.trim();
     if agent == "amp"
@@ -1083,5 +1100,24 @@ mod tests {
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
         );
+    }
+
+    #[test]
+    fn agent_executable_match_requires_the_binary_not_a_title_alias() {
+        // A real TUI runs the agent binary as the foreground command.
+        assert!(command_matches_agent_executable("opencode", "opencode"));
+        assert!(command_matches_agent_executable(
+            "/home/user/.opencode/bin/opencode",
+            "opencode"
+        ));
+        assert!(command_matches_agent_executable("opencode.exe", "opencode"));
+        // Aliases map to their canonical agent name.
+        assert!(command_matches_agent_executable("claude", "claude-code"));
+
+        // A node-based bridge whose title merely contains the agent name must
+        // not look like the agent executable.
+        assert!(!command_matches_agent_executable("node", "opencode"));
+        assert!(!command_matches_agent_executable("bash", "opencode"));
+        assert!(!command_matches_agent_executable("opencode-telegram", "opencode"));
     }
 }
